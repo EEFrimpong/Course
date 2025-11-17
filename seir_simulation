@@ -1,374 +1,517 @@
-{
-  "nbformat": 4,
-  "nbformat_minor": 0,
-  "metadata": {
-    "colab": {
-      "provenance": [],
-      "authorship_tag": "ABX9TyMVJcUHY80OoPDzvrtKe39G",
-      "include_colab_link": true
-    },
-    "kernelspec": {
-      "name": "python3",
-      "display_name": "Python 3"
-    },
-    "language_info": {
-      "name": "python"
+# -*- coding: utf-8 -*-
+"""seir_simulation.py - SEIR Model with Optional MPC Control"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+import pybounds
+
+############################################################################################
+# Set some global parameters
+############################################################################################
+mu = 0.0001          # Birth/Death rate per day
+beta = 0.5           # Transmission rate
+sigma = 0.3          # Incubation rate (1/sigma = incubation period)
+gamma = 0.2          # Recovery rate (1/gamma = infectious period)
+N = 1000000          # Total population
+
+############################################################################################
+# Continuous time dynamics function
+############################################################################################
+class F(object):
+    def __init__(self):
+        pass
+
+    def f(self, x_vec, u_vec, mu=mu, beta=beta, sigma=sigma, gamma=gamma, N=N, 
+          return_state_names=False):
+        """
+        Continuous time dynamics function for SEIR model.
+
+        Parameters:
+        x_vec : array-like, shape (4,)
+            State vector [S, E, I, R]
+        u_vec : array-like, shape (3,)
+            Control vector [u1, u2, u3]
+            u1: transmission reduction (0=no reduction, 1=full reduction)
+            u2: vaccination rate
+            u3: treatment/isolation rate
+        mu : float
+            Birth/death rate per day
+        beta : float
+            Transmission rate
+        sigma : float
+            Incubation rate (1/sigma = incubation period)
+        gamma : float
+            Recovery rate (1/gamma = infectious period)
+        N : float
+            Total population
+
+        Returns:
+        x_dot : numpy array, shape (4,)
+            Time derivative of state vector
+        """
+        if return_state_names:
+            return ['S', 'E', 'I', 'R']
+
+        # Extract state variables
+        S = x_vec[0]
+        E = x_vec[1]
+        I = x_vec[2]
+        R = x_vec[3]
+
+        # Extract control inputs
+        u1 = u_vec[0]  # transmission reduction (social distancing/masks)
+        u2 = u_vec[1]  # vaccination rate
+        u3 = u_vec[2]  # treatment/isolation rate
+
+        # SEIR dynamics matching your sample
+        dS_dt = mu * N - beta * (1 - u1) * S * I / N - u2 * S - mu * S
+        dE_dt = beta * (1 - u1) * S * I / N - sigma * E - mu * E
+        dI_dt = sigma * E - (gamma + u3) * I - mu * I
+        dR_dt = (gamma + u3) * I + u2 * S - mu * R
+
+        x_dot_vec = np.array([dS_dt, dE_dt, dI_dt, dR_dt])
+
+        return x_dot_vec
+
+
+############################################################################################
+# Continuous time measurement functions
+############################################################################################
+class H(object):
+    def __init__(self, measurement_option):
+        self.measurement_option = measurement_option
+
+    def h(self, x_vec, u_vec, return_measurement_names=False):
+        h_func = self.__getattribute__(self.measurement_option)
+        return h_func(x_vec, u_vec, return_measurement_names=return_measurement_names)
+
+    def h_ir(self, x_vec, u_vec, return_measurement_names=False):
+        """
+        Primary measurement: y = [I, R]^T (Infected and Recovered populations)
+        """
+        if return_measurement_names:
+            return ['I_absolute', 'R_absolute']
+
+        I = x_vec[2]
+        R = x_vec[3]
+        y_vec = np.array([I, R])
+
+        return y_vec
+
+    def h_i(self, x_vec, u_vec, return_measurement_names=False):
+        """
+        Alternative measurement 1: y = [I] (Infected population only)
+        """
+        if return_measurement_names:
+            return ['I_absolute']
+
+        I = x_vec[2]
+        y_vec = np.array([I])
+
+        return y_vec
+
+    def h_ei(self, x_vec, u_vec, return_measurement_names=False):
+        """
+        Alternative measurement 2: y = [E, I]^T (Exposed and Infected)
+        """
+        if return_measurement_names:
+            return ['E_absolute', 'I_absolute']
+
+        E = x_vec[1]
+        I = x_vec[2]
+        y_vec = np.array([E, I])
+
+        return y_vec
+
+    def h_all(self, x_vec, u_vec, return_measurement_names=False):
+        """
+        Alternative measurement 3: y = [S, E, I, R]^T (All compartments)
+        """
+        if return_measurement_names:
+            return ['S_absolute', 'E_absolute', 'I_absolute', 'R_absolute']
+
+        S = x_vec[0]
+        E = x_vec[1]
+        I = x_vec[2]
+        R = x_vec[3]
+        y_vec = np.array([S, E, I, R])
+
+        return y_vec
+
+
+############################################################################################
+# Simple SEIR simulation using scipy.integrate.solve_ivp (matching your sample)
+############################################################################################
+def simulate_seir_simple(x0, t_sim, u1_series=None, u2=0.01, u3=0.0, 
+                        beta=beta, sigma=sigma, gamma=gamma, mu=mu, N=N,
+                        method='RK45'):
+    """
+    Simple SEIR simulation using scipy.integrate.solve_ivp
+    
+    Parameters:
+    -----------
+    x0 : array-like, shape (4,)
+        Initial conditions [S, E, I, R]
+    t_sim : array-like
+        Time points for simulation
+    u1_series : array-like, optional
+        Time-varying transmission reduction. If None, u1=0 (no intervention)
+    u2 : float or array-like
+        Vaccination rate (constant or time-varying)
+    u3 : float or array-like
+        Treatment/isolation rate (constant or time-varying)
+    method : str
+        ODE solver method ('RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA')
+    
+    Returns:
+    --------
+    t_sim : array
+        Time points
+    x_sim : dict
+        State trajectories with keys 'S', 'E', 'I', 'R'
+    u_sim : dict
+        Control trajectories with keys 'u1', 'u2', 'u3'
+    """
+    
+    # Set default u1 if not provided
+    if u1_series is None:
+        u1_series = np.zeros_like(t_sim)
+    
+    # Ensure u1_series is an array
+    if np.isscalar(u1_series):
+        u1_series = u1_series * np.ones_like(t_sim)
+    
+    # Ensure u2 and u3 are arrays
+    if np.isscalar(u2):
+        u2_series = u2 * np.ones_like(t_sim)
+    else:
+        u2_series = u2
+        
+    if np.isscalar(u3):
+        u3_series = u3 * np.ones_like(t_sim)
+    else:
+        u3_series = u3
+    
+    def seir_ode(t, x):
+        """SEIR differential equations with time-varying controls"""
+        # Interpolate control at current time
+        idx = np.searchsorted(t_sim, t, side='right') - 1
+        idx = np.clip(idx, 0, len(t_sim) - 1)
+        
+        u1_current = u1_series[idx]
+        u2_current = u2_series[idx]
+        u3_current = u3_series[idx]
+        
+        S, E, I, R = x
+        dS = mu*N - beta*(1-u1_current)*S*I/N - u2_current*S - mu*S
+        dE = beta*(1-u1_current)*S*I/N - sigma*E - mu*E
+        dI = sigma*E - (gamma + u3_current)*I - mu*I
+        dR = (gamma + u3_current)*I + u2_current*S - mu*R
+        return [dS, dE, dI, dR]
+    
+    # Solve ODE
+    sol = solve_ivp(seir_ode, [t_sim[0], t_sim[-1]], x0, 
+                    t_eval=t_sim, method=method, dense_output=True)
+    
+    # Package results
+    x_sim = {
+        'S': sol.y[0],
+        'E': sol.y[1],
+        'I': sol.y[2],
+        'R': sol.y[3]
     }
-  },
-  "cells": [
-    {
-      "cell_type": "markdown",
-      "metadata": {
-        "id": "view-in-github",
-        "colab_type": "text"
-      },
-      "source": [
-        "<a href=\"https://colab.research.google.com/github/EEFrimpong/Course/blob/main/seir_simulation.ipynb\" target=\"_parent\"><img src=\"https://colab.research.google.com/assets/colab-badge.svg\" alt=\"Open In Colab\"/></a>"
-      ]
-    },
-    {
-      "cell_type": "code",
-      "execution_count": null,
-      "metadata": {
-        "id": "R1IXVggcGcFM"
-      },
-      "outputs": [],
-      "source": [
-        "# -*- coding: utf-8 -*-\n",
-        "\"\"\"seir_simulations.py - SEIR Model with MPC Control\"\"\"\n",
-        "\n",
-        "import numpy as np\n",
-        "import matplotlib.pyplot as plt\n",
-        "from scipy.integrate import odeint\n",
-        "import pybounds\n",
-        "\n",
-        "############################################################################################\n",
-        "# Set some global parameters\n",
-        "############################################################################################\n",
-        "mu = 0.000014        # Birth/Death rate per day (approximate)\n",
-        "beta = 0.5           # Transmission rate\n",
-        "sigma = 0.2          # Incubation rate (1/sigma = incubation period)\n",
-        "gamma = 0.1          # Recovery rate (1/gamma = infectious period)\n",
-        "N = 1000000          # Total population\n",
-        "\n",
-        "############################################################################################\n",
-        "# Continuous time dynamics function\n",
-        "############################################################################################\n",
-        "class F(object):\n",
-        "    def __init__(self):\n",
-        "        pass\n",
-        "\n",
-        "    def f(self, x_vec, u_vec, mu=mu, beta=beta, sigma=sigma, gamma=gamma, N=N,\n",
-        "          return_state_names=False):\n",
-        "        \"\"\"\n",
-        "        Continuous time dynamics function for SEIR model.\n",
-        "\n",
-        "        Parameters:\n",
-        "        x_vec : array-like, shape (4,)\n",
-        "            State vector [S, E, I, R]\n",
-        "        u_vec : array-like, shape (3,)\n",
-        "            Control vector [u1, u2, u3]\n",
-        "            u1: transmission reduction (0=no reduction, 1=full reduction)\n",
-        "            u2: vaccination rate\n",
-        "            u3: treatment/isolation rate\n",
-        "        mu : float\n",
-        "            Birth/death rate per day\n",
-        "        beta : float\n",
-        "            Transmission rate\n",
-        "        sigma : float\n",
-        "            Incubation rate (1/sigma = incubation period)\n",
-        "        gamma : float\n",
-        "            Recovery rate (1/gamma = infectious period)\n",
-        "        N : float\n",
-        "            Total population\n",
-        "\n",
-        "        Returns:\n",
-        "        x_dot : numpy array, shape (4,)\n",
-        "            Time derivative of state vector\n",
-        "        \"\"\"\n",
-        "        if return_state_names:\n",
-        "            return ['S', 'E', 'I', 'R']\n",
-        "\n",
-        "        # Extract state variables\n",
-        "        S = x_vec[0]\n",
-        "        E = x_vec[1]\n",
-        "        I = x_vec[2]\n",
-        "        R = x_vec[3]\n",
-        "\n",
-        "        # Extract control inputs\n",
-        "        u1 = u_vec[0]  # transmission reduction (social distancing/masks)\n",
-        "        u2 = u_vec[1]  # vaccination rate\n",
-        "        u3 = u_vec[2]  # treatment/isolation rate\n",
-        "\n",
-        "        # SEIR dynamics\n",
-        "        dS_dt = mu * N - beta * (1 - u1) * S * I / N - u2 * S - mu * S\n",
-        "        dE_dt = beta * (1 - u1) * S * I / N - sigma * E - mu * E\n",
-        "        dI_dt = sigma * E - (gamma + u3) * I - mu * I\n",
-        "        dR_dt = (gamma + u3) * I + u2 * S - mu * R\n",
-        "\n",
-        "        x_dot_vec = np.array([dS_dt, dE_dt, dI_dt, dR_dt])\n",
-        "\n",
-        "        return x_dot_vec\n",
-        "\n",
-        "\n",
-        "############################################################################################\n",
-        "# Continuous time measurement functions\n",
-        "############################################################################################\n",
-        "class H(object):\n",
-        "    def __init__(self, measurement_option):\n",
-        "        self.measurement_option = measurement_option\n",
-        "\n",
-        "    def h(self, x_vec, u_vec, return_measurement_names=False):\n",
-        "        h_func = self.__getattribute__(self.measurement_option)\n",
-        "        return h_func(x_vec, u_vec, return_measurement_names=return_measurement_names)\n",
-        "\n",
-        "    def h_ir(self, x_vec, u_vec, return_measurement_names=False):\n",
-        "        \"\"\"\n",
-        "        Primary measurement: y = [I, R]^T (Infected and Recovered populations)\n",
-        "        This is the measurement specified in your model\n",
-        "        \"\"\"\n",
-        "        if return_measurement_names:\n",
-        "            return ['I_absolute', 'R_absolute']\n",
-        "\n",
-        "        # Extract state variables\n",
-        "        I = x_vec[2]\n",
-        "        R = x_vec[3]\n",
-        "\n",
-        "        # Measurements\n",
-        "        y_vec = np.array([I, R])\n",
-        "\n",
-        "        return y_vec\n",
-        "\n",
-        "    def h_i(self, x_vec, u_vec, return_measurement_names=False):\n",
-        "        \"\"\"\n",
-        "        Alternative measurement 1: y = [I] (Infected population only)\n",
-        "        \"\"\"\n",
-        "        if return_measurement_names:\n",
-        "            return ['I_absolute']\n",
-        "\n",
-        "        I = x_vec[2]\n",
-        "        y_vec = np.array([I])\n",
-        "\n",
-        "        return y_vec\n",
-        "\n",
-        "    def h_ei(self, x_vec, u_vec, return_measurement_names=False):\n",
-        "        \"\"\"\n",
-        "        Alternative measurement 2: y = [E, I]^T (Exposed and Infected)\n",
-        "        \"\"\"\n",
-        "        if return_measurement_names:\n",
-        "            return ['E_absolute', 'I_absolute']\n",
-        "\n",
-        "        E = x_vec[1]\n",
-        "        I = x_vec[2]\n",
-        "        y_vec = np.array([E, I])\n",
-        "\n",
-        "        return y_vec\n",
-        "\n",
-        "    def h_all(self, x_vec, u_vec, return_measurement_names=False):\n",
-        "        \"\"\"\n",
-        "        Alternative measurement 3: y = [S, E, I, R]^T (All compartments)\n",
-        "        \"\"\"\n",
-        "        if return_measurement_names:\n",
-        "            return ['S_absolute', 'E_absolute', 'I_absolute', 'R_absolute']\n",
-        "\n",
-        "        S = x_vec[0]\n",
-        "        E = x_vec[1]\n",
-        "        I = x_vec[2]\n",
-        "        R = x_vec[3]\n",
-        "        y_vec = np.array([S, E, I, R])\n",
-        "\n",
-        "        return y_vec\n",
-        "\n",
-        "\n",
-        "############################################################################################\n",
-        "# SEIR simulation\n",
-        "############################################################################################\n",
-        "def simulate_seir(f, h, tsim_length=365, dt=1.0, measurement_names=None,\n",
-        "                  setpoint=None, rterm_u1=1e-3, rterm_u2=1e-3, rterm_u3=1e-3, x0=None):\n",
-        "    \"\"\"\n",
-        "    Simulate SEIR disease model with MPC control\n",
-        "\n",
-        "    Parameters:\n",
-        "    -----------\n",
-        "    f : function\n",
-        "        Dynamics function\n",
-        "    h : function\n",
-        "        Measurement function\n",
-        "    tsim_length : float\n",
-        "        Total simulation time in days\n",
-        "    dt : float\n",
-        "        Time step in days\n",
-        "    measurement_names : list\n",
-        "        Names of measurements\n",
-        "    setpoint : dict\n",
-        "        Desired trajectories for states\n",
-        "    rterm_u1 : float\n",
-        "        Control input penalty for transmission reduction\n",
-        "    rterm_u2 : float\n",
-        "        Control input penalty for vaccination\n",
-        "    rterm_u3 : float\n",
-        "        Control input penalty for treatment\n",
-        "    x0 : array-like\n",
-        "        Initial conditions\n",
-        "\n",
-        "    Returns:\n",
-        "    --------\n",
-        "    t_sim, x_sim, u_sim, y_sim, simulator\n",
-        "    \"\"\"\n",
-        "    # Set state and input names\n",
-        "    state_names = f(None, None, return_state_names=True)\n",
-        "    input_names = ['u1', 'u2', 'u3']  # transmission reduction, vaccination, treatment\n",
-        "\n",
-        "    # Choose the measurement function\n",
-        "    if measurement_names is None:\n",
-        "        try:\n",
-        "            measurement_names = h(None, None, return_measurement_names=True)\n",
-        "        except:\n",
-        "            raise ValueError('Need to provide measurement_names as a list of strings')\n",
-        "\n",
-        "    # Initialize simulator\n",
-        "    simulator = pybounds.Simulator(f, h, dt=dt, state_names=state_names,\n",
-        "                                   input_names=input_names, measurement_names=measurement_names,\n",
-        "                                   mpc_horizon=int(20/dt))\n",
-        "\n",
-        "    # Define the time horizon\n",
-        "    tsim = np.arange(0, tsim_length, step=dt)\n",
-        "    NA = np.zeros_like(tsim)\n",
-        "\n",
-        "    # Define default setpoint if not provided\n",
-        "    if setpoint is None:\n",
-        "        # Get initial conditions\n",
-        "        if x0 is not None:\n",
-        "            I_initial = x0[2]\n",
-        "        else:\n",
-        "            I_initial = 1000\n",
-        "\n",
-        "        # Infection setpoint: Decrease infections exponentially\n",
-        "        I_target = 0.001 * N\n",
-        "        I_setpoint = np.maximum(I_initial * np.exp(-tsim / 100), I_target)\n",
-        "\n",
-        "        # Exposed setpoint: Decrease exposed exponentially\n",
-        "        E_target = 0.001 * N\n",
-        "        E_setpoint = np.maximum(I_initial * np.exp(-tsim / 100), E_target)\n",
-        "\n",
-        "        setpoint = {\n",
-        "            'S': NA,\n",
-        "            'E': E_setpoint,\n",
-        "            'I': I_setpoint,\n",
-        "            'R': NA,\n",
-        "        }\n",
-        "\n",
-        "    # Update the simulator set-point\n",
-        "    simulator.update_dict(setpoint, name='setpoint')\n",
-        "\n",
-        "    # Define MPC cost function\n",
-        "    cost_I = (simulator.model.x['I'] - simulator.model.tvp['I_set']) ** 2\n",
-        "    cost_E = (simulator.model.x['E'] - simulator.model.tvp['E_set']) ** 2\n",
-        "    cost = 100 * cost_I + 10 * cost_E\n",
-        "\n",
-        "    # Set cost function\n",
-        "    simulator.mpc.set_objective(mterm=cost, lterm=cost)\n",
-        "\n",
-        "    # Set input penalty\n",
-        "    simulator.mpc.set_rterm(u1=rterm_u1, u2=rterm_u2, u3=rterm_u3)\n",
-        "\n",
-        "    # Set bounds on states and controls\n",
-        "    simulator.mpc.bounds['lower', '_x', 'S'] = 0.0\n",
-        "    simulator.mpc.bounds['upper', '_x', 'S'] = N\n",
-        "    simulator.mpc.bounds['lower', '_x', 'E'] = 0.0\n",
-        "    simulator.mpc.bounds['upper', '_x', 'E'] = N\n",
-        "    simulator.mpc.bounds['lower', '_x', 'I'] = 0.0\n",
-        "    simulator.mpc.bounds['upper', '_x', 'I'] = N\n",
-        "    simulator.mpc.bounds['lower', '_x', 'R'] = 0.0\n",
-        "    simulator.mpc.bounds['upper', '_x', 'R'] = N\n",
-        "\n",
-        "    # Control bounds as specified\n",
-        "    simulator.mpc.bounds['lower', '_u', 'u1'] = 0.0\n",
-        "    simulator.mpc.bounds['upper', '_u', 'u1'] = 1.0\n",
-        "    simulator.mpc.bounds['lower', '_u', 'u2'] = 0.0\n",
-        "    simulator.mpc.bounds['upper', '_u', 'u2'] = 1.0\n",
-        "    simulator.mpc.bounds['lower', '_u', 'u3'] = 0.0\n",
-        "    simulator.mpc.bounds['upper', '_u', 'u3'] = 1.0\n",
-        "\n",
-        "    # Run simulation using MPC\n",
-        "    t_sim, x_sim, u_sim, y_sim, = simulator.simulate(x0=x0, u=None, mpc=True, return_full_output=True)\n",
-        "\n",
-        "    return t_sim, x_sim, u_sim, y_sim, simulator\n",
-        "\n",
-        "\n",
-        "############################################################################################\n",
-        "# Example usage\n",
-        "############################################################################################\n",
-        "if __name__ == \"__main__\":\n",
-        "    # Define initial conditions\n",
-        "    # S, E, I, R\n",
-        "    x0 = np.array([\n",
-        "        990000,    # S - Susceptible (99% of population)\n",
-        "        5000,      # E - Exposed\n",
-        "        4000,      # I - Infected\n",
-        "        1000       # R - Recovered\n",
-        "    ])\n",
-        "\n",
-        "    # Create dynamics object\n",
-        "    f_obj = F()\n",
-        "\n",
-        "    print(\"=\"*80)\n",
-        "    print(\"TESTING SEIR MODEL WITH DIFFERENT MEASUREMENT OPTIONS\")\n",
-        "    print(\"=\"*80)\n",
-        "\n",
-        "    # Test different measurement options\n",
-        "    measurement_options = [\n",
-        "        ('h_ir', 'Primary: I + R (as specified in your model)'),\n",
-        "        ('h_i', 'Alternative 1: I only'),\n",
-        "        ('h_ei', 'Alternative 2: E + I'),\n",
-        "        ('h_all', 'Alternative 3: S + E + I + R (Full)')\n",
-        "    ]\n",
-        "\n",
-        "    results = {}\n",
-        "\n",
-        "    for option_name, description in measurement_options:\n",
-        "        print(f\"\\n{description}\")\n",
-        "        print(\"-\" * 60)\n",
-        "\n",
-        "        h_obj = H(measurement_option=option_name)\n",
-        "        measurement_names = h_obj.h(None, None, return_measurement_names=True)\n",
-        "        print(f\"Measurements: {measurement_names}\")\n",
-        "\n",
-        "        try:\n",
-        "            t_sim, x_sim, u_sim, y_sim, simulator = simulate_seir(\n",
-        "                f_obj.f, h_obj.h, tsim_length=365, dt=1.0, x0=x0\n",
-        "            )\n",
-        "            results[option_name] = {\n",
-        "                't': t_sim,\n",
-        "                'x': x_sim,\n",
-        "                'u': u_sim,\n",
-        "                'y': y_sim,\n",
-        "                'simulator': simulator,\n",
-        "                'measurements': measurement_names\n",
-        "            }\n",
-        "            print(f\"✓ Simulation successful\")\n",
-        "            print(f\"  Final S: {x_sim['S'][-1]:.0f}\")\n",
-        "            print(f\"  Final E: {x_sim['E'][-1]:.0f}\")\n",
-        "            print(f\"  Final I: {x_sim['I'][-1]:.0f}\")\n",
-        "            print(f\"  Final R: {x_sim['R'][-1]:.0f}\")\n",
-        "        except Exception as e:\n",
-        "            print(f\"✗ Simulation failed: {str(e)}\")\n",
-        "\n",
-        "    print(\"\\n\" + \"=\"*80)\n",
-        "    print(\"SEIR MODEL SIMULATION COMPLETE\")\n",
-        "    print(\"=\"*80)\n",
-        "    print(\"\\nModel parameters:\")\n",
-        "    print(f\"  μ (birth/death rate): {mu}\")\n",
-        "    print(f\"  β (transmission rate): {beta}\")\n",
-        "    print(f\"  σ (incubation rate): {sigma} (incubation period: {1/sigma:.1f} days)\")\n",
-        "    print(f\"  γ (recovery rate): {gamma} (infectious period: {1/gamma:.1f} days)\")\n",
-        "    print(f\"  N (population): {N}\")\n",
-        "    print(\"\\nControl inputs:\")\n",
-        "    print(\"  u1: Transmission reduction (social distancing/masks), 0 ≤ u1 ≤ 1\")\n",
-        "    print(\"  u2: Vaccination rate, 0 ≤ u2 ≤ 1\")\n",
-        "    print(\"  u3: Treatment/isolation rate, 0 ≤ u3 ≤ 1\")\n",
-        "    print(\"=\"*80)"
-      ]
+    
+    u_sim = {
+        'u1': u1_series,
+        'u2': u2_series,
+        'u3': u3_series
     }
-  ]
-}
+    
+    return sol.t, x_sim, u_sim
+
+
+############################################################################################
+# MPC-based SEIR simulation (original functionality)
+############################################################################################
+def simulate_seir_mpc(f, h, tsim_length=365, dt=1.0, measurement_names=None,
+                     setpoint=None, rterm_u1=1e-3, rterm_u2=1e-3, rterm_u3=1e-3, x0=None):
+    """
+    Simulate SEIR disease model with MPC control (original version)
+
+    Parameters:
+    -----------
+    f : function
+        Dynamics function
+    h : function
+        Measurement function
+    tsim_length : float
+        Total simulation time in days
+    dt : float
+        Time step in days
+    measurement_names : list
+        Names of measurements
+    setpoint : dict
+        Desired trajectories for states
+    rterm_u1 : float
+        Control input penalty for transmission reduction
+    rterm_u2 : float
+        Control input penalty for vaccination
+    rterm_u3 : float
+        Control input penalty for treatment
+    x0 : array-like
+        Initial conditions
+
+    Returns:
+    --------
+    t_sim, x_sim, u_sim, y_sim, simulator
+    """
+    # Set state and input names
+    state_names = f(None, None, return_state_names=True)
+    input_names = ['u1', 'u2', 'u3']
+
+    # Choose the measurement function
+    if measurement_names is None:
+        try:
+            measurement_names = h(None, None, return_measurement_names=True)
+        except:
+            raise ValueError('Need to provide measurement_names as a list of strings')
+
+    # Initialize simulator
+    simulator = pybounds.Simulator(f, h, dt=dt, state_names=state_names,
+                                   input_names=input_names, measurement_names=measurement_names,
+                                   mpc_horizon=int(20/dt))
+
+    # Define the time horizon
+    tsim = np.arange(0, tsim_length, step=dt)
+    NA = np.zeros_like(tsim)
+
+    # Define default setpoint if not provided
+    if setpoint is None:
+        if x0 is not None:
+            I_initial = x0[2]
+        else:
+            I_initial = 1000
+
+        I_target = 0.001 * N
+        I_setpoint = np.maximum(I_initial * np.exp(-tsim / 100), I_target)
+
+        E_target = 0.001 * N
+        E_setpoint = np.maximum(I_initial * np.exp(-tsim / 100), E_target)
+
+        setpoint = {
+            'S': NA,
+            'E': E_setpoint,
+            'I': I_setpoint,
+            'R': NA,
+        }
+
+    # Update the simulator set-point
+    simulator.update_dict(setpoint, name='setpoint')
+
+    # Define MPC cost function
+    cost_I = (simulator.model.x['I'] - simulator.model.tvp['I_set']) ** 2
+    cost_E = (simulator.model.x['E'] - simulator.model.tvp['E_set']) ** 2
+    cost = 100 * cost_I + 10 * cost_E
+
+    # Set cost function
+    simulator.mpc.set_objective(mterm=cost, lterm=cost)
+
+    # Set input penalty
+    simulator.mpc.set_rterm(u1=rterm_u1, u2=rterm_u2, u3=rterm_u3)
+
+    # Set bounds on states and controls
+    simulator.mpc.bounds['lower', '_x', 'S'] = 0.0
+    simulator.mpc.bounds['upper', '_x', 'S'] = N
+    simulator.mpc.bounds['lower', '_x', 'E'] = 0.0
+    simulator.mpc.bounds['upper', '_x', 'E'] = N
+    simulator.mpc.bounds['lower', '_x', 'I'] = 0.0
+    simulator.mpc.bounds['upper', '_x', 'I'] = N
+    simulator.mpc.bounds['lower', '_x', 'R'] = 0.0
+    simulator.mpc.bounds['upper', '_x', 'R'] = N
+    
+    # Control bounds
+    simulator.mpc.bounds['lower', '_u', 'u1'] = 0.0
+    simulator.mpc.bounds['upper', '_u', 'u1'] = 1.0
+    simulator.mpc.bounds['lower', '_u', 'u2'] = 0.0
+    simulator.mpc.bounds['upper', '_u', 'u2'] = 1.0
+    simulator.mpc.bounds['lower', '_u', 'u3'] = 0.0
+    simulator.mpc.bounds['upper', '_u', 'u3'] = 1.0
+
+    # Run simulation using MPC
+    t_sim, x_sim, u_sim, y_sim, = simulator.simulate(x0=x0, u=None, mpc=True, return_full_output=True)
+
+    return t_sim, x_sim, u_sim, y_sim, simulator
+
+
+############################################################################################
+# Wrapper function for backward compatibility
+############################################################################################
+def simulate_seir(f, h, tsim_length=365, dt=1.0, x0=None, use_mpc=False, **kwargs):
+    """
+    Wrapper function that chooses between simple and MPC simulation
+    
+    Parameters:
+    -----------
+    use_mpc : bool
+        If True, use MPC control. If False, use simple solve_ivp simulation
+    """
+    if use_mpc:
+        return simulate_seir_mpc(f, h, tsim_length, dt, x0=x0, **kwargs)
+    else:
+        # Simple simulation
+        t_sim = np.arange(0, tsim_length, dt)
+        u1_series = kwargs.get('u1_series', 0.1 * np.sin(2 * np.pi * t_sim / 365))
+        u2 = kwargs.get('u2', 0.01)
+        u3 = kwargs.get('u3', 0.0)
+        method = kwargs.get('method', 'RK45')
+        
+        t, x_sim, u_sim = simulate_seir_simple(x0, t_sim, u1_series, u2, u3, method=method)
+        
+        # Generate measurements
+        y_sim = {}
+        measurement_names = h(None, None, return_measurement_names=True)
+        for i, t_point in enumerate(t):
+            x_vec = np.array([x_sim['S'][i], x_sim['E'][i], x_sim['I'][i], x_sim['R'][i]])
+            u_vec = np.array([u_sim['u1'][i], u_sim['u2'][i], u_sim['u3'][i]])
+            y_vec = h(x_vec, u_vec)
+            for j, name in enumerate(measurement_names):
+                if name not in y_sim:
+                    y_sim[name] = []
+                y_sim[name].append(y_vec[j])
+        
+        # Convert lists to arrays
+        for name in y_sim:
+            y_sim[name] = np.array(y_sim[name])
+        
+        return t, x_sim, u_sim, y_sim, None
+
+
+############################################################################################
+# Example usage
+############################################################################################
+def main():
+    """Main function matching your sample"""
+    
+    print("="*80)
+    print("SEIR MODEL SIMULATION (matching your sample)")
+    print("="*80)
+    
+    # ----------------------------
+    # Parameters (matching your sample)
+    # ----------------------------
+    days = 365
+    t_sim = np.arange(days)
+    
+    N = 1_000_000
+    beta = 0.5
+    sigma = 0.3
+    gamma = 0.2
+    mu = 0.0001
+    u2 = 0.01
+    
+    # ----------------------------
+    # Initial conditions (matching your sample)
+    # ----------------------------
+    x0 = np.array([999500, 400, 100, 0], dtype=float)
+    
+    # ----------------------------
+    # Time-varying intervention u1 (matching your sample)
+    # ----------------------------
+    u1_series = 0.1 * np.sin(2 * np.pi * t_sim / 365)
+    
+    print(f"\nParameters:")
+    print(f"  N = {N:,}")
+    print(f"  β = {beta}")
+    print(f"  σ = {sigma} (incubation period: {1/sigma:.1f} days)")
+    print(f"  γ = {gamma} (infectious period: {1/gamma:.1f} days)")
+    print(f"  μ = {mu}")
+    print(f"  u2 (vaccination) = {u2}")
+    print(f"  u1 (time-varying): 0.1*sin(2πt/365)")
+    
+    print(f"\nInitial conditions:")
+    print(f"  S = {x0[0]:,.0f}")
+    print(f"  E = {x0[1]:,.0f}")
+    print(f"  I = {x0[2]:,.0f}")
+    print(f"  R = {x0[3]:,.0f}")
+    
+    # ----------------------------
+    # Simulate using different ODE solvers
+    # ----------------------------
+    solvers = ['RK45', 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA']
+    
+    print(f"\n" + "="*80)
+    print("Testing different ODE solvers:")
+    print("="*80)
+    
+    for solver in solvers:
+        print(f"\nSolver: {solver}")
+        try:
+            t, x_sim, u_sim = simulate_seir_simple(
+                x0, t_sim, u1_series, u2, u3=0.0,
+                beta=beta, sigma=sigma, gamma=gamma, mu=mu, N=N,
+                method=solver
+            )
+            print(f"  ✓ Success!")
+            print(f"  Final S: {x_sim['S'][-1]:,.0f}")
+            print(f"  Final E: {x_sim['E'][-1]:,.0f}")
+            print(f"  Final I: {x_sim['I'][-1]:,.0f}")
+            print(f"  Final R: {x_sim['R'][-1]:,.0f}")
+        except Exception as e:
+            print(f"  ✗ Failed: {e}")
+    
+    # ----------------------------
+    # Plot results using RK45 (default)
+    # ----------------------------
+    print(f"\n" + "="*80)
+    print("Generating plots...")
+    print("="*80)
+    
+    t, x_sim, u_sim = simulate_seir_simple(x0, t_sim, u1_series, u2)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    
+    # Plot SEIR compartments
+    axes[0, 0].plot(t, x_sim['S'], label='S', linewidth=2)
+    axes[0, 0].plot(t, x_sim['E'], label='E', linewidth=2)
+    axes[0, 0].plot(t, x_sim['I'], label='I', linewidth=2)
+    axes[0, 0].plot(t, x_sim['R'], label='R', linewidth=2)
+    axes[0, 0].set_xlabel('Time (days)')
+    axes[0, 0].set_ylabel('Population')
+    axes[0, 0].set_title('SEIR Compartments')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Plot infected only
+    axes[0, 1].plot(t, x_sim['I'], 'r-', linewidth=2)
+    axes[0, 1].set_xlabel('Time (days)')
+    axes[0, 1].set_ylabel('Infected')
+    axes[0, 1].set_title('Infected Population')
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Plot control u1
+    axes[1, 0].plot(t, u_sim['u1'], 'b-', linewidth=2)
+    axes[1, 0].set_xlabel('Time (days)')
+    axes[1, 0].set_ylabel('u1 (transmission reduction)')
+    axes[1, 0].set_title('Time-Varying Intervention: u1 = 0.1*sin(2πt/365)')
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Plot E and I together
+    axes[1, 1].plot(t, x_sim['E'], 'orange', label='Exposed', linewidth=2)
+    axes[1, 1].plot(t, x_sim['I'], 'red', label='Infected', linewidth=2)
+    axes[1, 1].set_xlabel('Time (days)')
+    axes[1, 1].set_ylabel('Population')
+    axes[1, 1].set_title('Exposed and Infected')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print("\n✓ Simulation complete!")
+    
+    return t, x_sim, u_sim
+
+
+if __name__ == "__main__":
+    main()
