@@ -268,10 +268,10 @@ def main():
     # Define initial conditions
     # S, E, I, R
     x0 = np.array([
-        990000,    # S - Susceptible (99% of population)
-        5000,      # E - Exposed
-        4000,      # I - Infected
-        1000       # R - Recovered
+        999500,    # S - Susceptible 
+        400,      # E - Exposed
+        100,      # I - Infected
+        0       # R - Recovered
     ])
 
     # Create dynamics object
